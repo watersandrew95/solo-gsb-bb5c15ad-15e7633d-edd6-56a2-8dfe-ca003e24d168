@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.core import (
     REASON_INCOMPATIBLE_MODULUS,
     REASON_INSUFFICIENT_CAPACITY,
+    REASON_LOSS_SEGMENT_NEGATIVE,
     REASON_NO_FEASIBLE_ALLOCATION,
     REASON_RANGE_DISJOINT,
     REASON_TOTAL_INCOMPATIBLE_MODULUS,
@@ -27,6 +28,8 @@ from app.core import (
     clip_merge_intervals,
     compare_dual_meter,
     format_decimal_string,
+    LossMeterSegment,
+    reconcile_master_sub_loss,
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
@@ -38,7 +41,7 @@ from app.core import (
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -69,7 +72,14 @@ app = FastAPI(
         "增量与回绕模数判定（复用同一精确速率运算），在首尾读数必须"
         "保留的前提下求删除最少内部读数的完整序列（DAG 最长路径，"
         "O(n²)，不枚举保留子序列），多组最优解按保留索引序列字典序"
-        "选定，首尾无法连通时返回明确无解状态。"
+        "选定，首尾无法连通时返回明确无解状态；"
+        "另支持总分表漏损复核：同一模数的一块总表与至少一块分表共用"
+        "同一组严格递增秒精度时刻（各表可有各自速率上限），逐表复用"
+        "读数与速率校验求各段非负用量的可行回绕圈数区间，按同模数下"
+        "圈数区间的连续差值求每段漏损（总表用量减各分表用量之和，非负）"
+        "的可行范围，再以给定整期漏损总量联立收紧各段范围，仅在唯一时"
+        "给出确定漏损，不枚举回绕组合；区分单表无解、单段漏损无法非负、"
+        "总量同余冲突与总量超界。"
     ),
 )
 
@@ -2282,4 +2292,521 @@ def clean_abnormal_readings(req: CleanReadingsRequest) -> CleanReadingsResponse:
         removed_indices=list(result.removed_indices),
         removed_count=len(result.removed_indices),
         detail=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 总分表漏损复核（master-sub loss）
+# ---------------------------------------------------------------------------
+
+
+class MasterSubMeterReadings(BaseModel):
+    """一块表（总表或某块分表）的每秒速率上限与同一组时刻上的读数序列。"""
+
+    name: Optional[str] = Field(
+        default=None,
+        description="表名（可选，仅用于结果标识）；缺省时以角色与索引标识",
+    )
+    max_rate_per_second: Decimal = Field(
+        ge=0, description="该表每秒最大计数增量，支持小数（按精确分数计算）"
+    )
+    readings: List[Reading] = Field(
+        min_length=2, description="与其他表共用的同一组时刻上的读数，至少 2 条"
+    )
+
+    @model_validator(mode="after")
+    def _check_readings_internal(self) -> "MasterSubMeterReadings":
+        # 模数范围由顶层请求统一校验（各表共用同一模数）；此处仅校验时序
+        for prev, cur in zip(self.readings, self.readings[1:]):
+            if cur.timestamp <= prev.timestamp:
+                raise ValueError(
+                    "时间戳必须严格递增："
+                    f"{prev.timestamp.isoformat()} 之后出现 {cur.timestamp.isoformat()}"
+                )
+        return self
+
+
+class MasterSubLossRequest(BaseModel):
+    """总分表漏损复核请求：同一模数的一块总表与至少一块分表。
+
+    各表共用同一组秒精度、带时区且严格递增的时刻（允许不同时区表达，
+    换算 UTC 后必须一一相同），读数范围、模数、速率的校验与其他接口
+    一致（复用同一 Reading 时间戳校验）。
+    """
+
+    modulus: int = Field(ge=1, description="总表与各分表共用的计数器模数（回绕周期）")
+    total_loss: int = Field(ge=0, description="给定的整期漏损总量（非负整数）")
+    master: MasterSubMeterReadings = Field(description="总表（母表）的速率与读数")
+    sub_meters: List[MasterSubMeterReadings] = Field(
+        min_length=1, description="分表（子表）列表，至少一块；各自可有独立速率上限"
+    )
+
+    @model_validator(mode="after")
+    def _check_request(self) -> "MasterSubLossRequest":
+        all_meters = [self.master, *self.sub_meters]
+        labels = ["总表"] + [
+            f"分表[{i}]" + (f"（{m.name}）" if m.name else "")
+            for i, m in enumerate(self.sub_meters)
+        ]
+        for label, meter in zip(labels, all_meters):
+            for r in meter.readings:
+                if r.value >= self.modulus:
+                    raise ValueError(
+                        f"{label}读数 {r.value} 超出模数范围 [0, {self.modulus})"
+                    )
+        n = len(self.master.readings)
+        for label, meter in zip(labels[1:], self.sub_meters):
+            if len(meter.readings) != n:
+                raise ValueError(
+                    f"{label}读数条数 {len(meter.readings)} 与总表 {n} 不一致："
+                    "总表与各分表必须共用同一组时刻（读数条数相同）"
+                )
+        # 各表内部时刻已校验严格递增；此处逐分表比较同一位置时刻必须一致
+        for j, meter in enumerate(self.sub_meters):
+            for i, (rm, rs) in enumerate(
+                zip(self.master.readings, meter.readings)
+            ):
+                if rm.timestamp != rs.timestamp:
+                    raise ValueError(
+                        f"分表[{j}]"
+                        + (f"（{meter.name}）" if meter.name else "")
+                        + f"第 {i} 条读数时刻 {rs.timestamp.isoformat()} 与总表"
+                        f"同位置时刻 {rm.timestamp.isoformat()} 不一致："
+                        "总表与各分表必须共用完全相同的时刻序列"
+                    )
+        return self
+
+
+class LossMeterSegmentOut(BaseModel):
+    """某块表在某段上的独立可行圈数/用量范围（联立总量前）。"""
+
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    min_wraps: int = Field(description="满足非负增量与该表速率上限的最小回绕次数")
+    max_wraps: int = Field(description="满足非负增量与该表速率上限的最大回绕次数")
+    min_usage: int = Field(description="该表该段独立可行用量下界（含）")
+    max_usage: int = Field(description="该表该段独立可行用量上界（含）")
+
+
+class LossMeterOut(BaseModel):
+    """一块表（总表或某块分表）的标识与各段独立可行范围。"""
+
+    role: Literal["master", "sub"] = Field(description="表角色：总表 / 分表")
+    index: Optional[int] = Field(
+        default=None, description="分表在 sub_meters 中的下标（总表为 null）"
+    )
+    name: Optional[str] = Field(default=None, description="请求给出的表名；缺省为 null")
+    max_rate_per_second: str = Field(
+        description="该表每秒速率上限的规范化十进制字符串（精确值，无浮点误差）"
+    )
+    segments: List[LossMeterSegmentOut] = Field(
+        description="该表各段的独立可行圈数/用量范围，按段索引升序"
+    )
+
+
+class LossSegmentRangeOut(BaseModel):
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    elapsed_seconds: int
+    min_loss: int = Field(
+        description="该段漏损下界（总表用量减各分表用量之和，非负，可达到）"
+    )
+    max_loss: int = Field(description="该段漏损上界（非负，可达到）")
+    unique: bool = Field(description="该段漏损是否已被整期总量唯一确定")
+    loss: Optional[int] = Field(
+        default=None, description="唯一时的确定漏损；仍有多解时为 null"
+    )
+    master_usage_min: int = Field(description="该段总表可行用量下界（含）")
+    master_usage_max: int = Field(description="该段总表可行用量上界（含）")
+    sub_usage_min: int = Field(description="该段各分表用量之和的下界（含）")
+    sub_usage_max: int = Field(description="该段各分表用量之和的上界（含）")
+
+
+class LossMeterSegmentErrorOut(BaseModel):
+    kind: Literal["meter_segment"] = Field(description="冲突层级：某块表的某段")
+    role: Literal["master", "sub"]
+    index: int = Field(description="段索引")
+    meter_index: Optional[int] = Field(
+        default=None, description="分表下标；总表为 null"
+    )
+    name: Optional[str] = None
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    reason: Literal["no_solution"]
+    detail: str
+    min_wraps: int
+    max_wraps: int
+
+
+class LossSegmentNegativeErrorOut(BaseModel):
+    kind: Literal["loss_segment"] = Field(description="冲突层级：单段漏损")
+    index: int = Field(description="段索引")
+    start_timestamp: datetime
+    end_timestamp: datetime
+    elapsed_seconds: int
+    reason: Literal["loss_segment_negative"]
+    detail: str
+    master_reading_diff: int = Field(description="该段总表读数差（末读 − 首读）")
+    sub_reading_diff_sum: int = Field(description="该段各分表读数差之和")
+    diff: int = Field(description="总表读数差减各分表读数差之和 D_i")
+    min_wraps: int = Field(
+        description="各表圈数区间连续差值给出的 w_i = k_主 − Σk_分 的下界（可负）"
+    )
+    max_wraps: int = Field(description="w_i 的上界")
+    required_min_wraps: int = Field(
+        description="非负漏损要求的 w_i 下界 ceil(−D_i / M)；大于 max_wraps 即无解"
+    )
+
+
+class LossTotalErrorOut(BaseModel):
+    kind: Literal["total"] = Field(description="冲突层级：整期漏损总量")
+    reason: Literal[
+        "total_incompatible_modulus", "total_out_of_range"
+    ]
+    detail: str
+    feasible_min_total: int = Field(description="各段非负漏损下界之和（含）")
+    feasible_max_total: int = Field(description="各段非负漏损上界之和（含）")
+    expected_remainder: Optional[int] = Field(
+        default=None, description="与模数相容时整期漏损应有的模 M 余数"
+    )
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="整期圈数差总和 W =（总漏损 − ΣD_i）/M；与模数不相容时为 null",
+    )
+
+
+class MasterSubLossResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_loss: int = Field(description="请求给出的整期漏损总量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="整期总表与分表圈数差总和 W；单表无解或与模数不相容时为 null",
+    )
+    meters: List[LossMeterOut] = Field(
+        description="总表（role=master）与各分表（role=sub，按下标升序）各段的"
+        "独立可行圈数/用量范围"
+    )
+    segments: List[LossSegmentRangeOut] = Field(
+        description="整期漏损总量联立后各段漏损范围：唯一者给出确定漏损，"
+        "其余给出上下界；冲突时为空"
+    )
+    unique: bool = Field(description="各段漏损是否全部被唯一确定")
+    conflicts: List[
+        Union[
+            LossMeterSegmentErrorOut,
+            LossSegmentNegativeErrorOut,
+            LossTotalErrorOut,
+        ]
+    ] = Field(
+        description="冲突明细：某块表某段无解（no_solution）、某段漏损无法非负"
+        "（loss_segment_negative）、整期总量同余不相容（total_incompatible_modulus）"
+        "或总量超界（total_out_of_range）"
+    )
+
+
+def _meter_segments_for_loss(req: MasterSubLossRequest):
+    """逐表逐段复用 solve_segment，返回 (表元数据列表, 段上下文, 核心段结果矩阵)。
+
+    表元数据为 ``(role, meter_index, name, rate_str, meter_model)``；
+    段上下文按段索引给出 ``(a_ts 起点, b_ts 终点, elapsed)``（各表共用）；
+    核心结果矩阵 ``matrix[m][i]`` 为 LossMeterSegment。
+    """
+    meter_models = [req.master, *req.sub_meters]
+    meta = [
+        (
+            "master" if m == 0 else "sub",
+            None if m == 0 else m - 1,
+            meter_models[m].name,
+            format(meter_models[m].max_rate_per_second, "f"),
+            meter_models[m],
+        )
+        for m in range(len(meter_models))
+    ]
+    timestamps = [r.timestamp for r in req.master.readings]
+    elapsed = [
+        int((b - a).total_seconds())
+        for a, b in zip(timestamps, timestamps[1:])
+    ]
+    matrix: List[List] = []
+    raw_solutions: List[List] = []  # [meter][seg] = solve_segment 结果（供明细）
+    for meter in meter_models:
+        max_rate = Fraction(meter.max_rate_per_second)
+        row, raw_row = [], []
+        for i, (a, b) in enumerate(zip(meter.readings, meter.readings[1:])):
+            sol = solve_segment(
+                i, a.value, b.value, elapsed[i], req.modulus, max_rate
+            )
+            raw_row.append(sol)
+            row.append(
+                LossMeterSegment(
+                    diff=b.value - a.value,
+                    min_wraps=sol.min_wraps,
+                    max_wraps=sol.max_wraps,
+                )
+            )
+        matrix.append(row)
+        raw_solutions.append(raw_row)
+    return meta, timestamps, elapsed, matrix, raw_solutions
+
+
+@app.post("/v1/usage/master-sub/loss-reconcile", response_model=MasterSubLossResponse)
+def reconcile_master_sub_loss_usage(
+    req: MasterSubLossRequest,
+) -> MasterSubLossResponse:
+    """总分表漏损复核：以整期漏损总量联立收紧各段漏损范围，不枚举回绕组合。
+
+    总表与至少一块分表共用同一模数与同一组严格递增秒精度时刻，各表可
+    有独立每秒速率上限。逐表复用现有读数/模数/速率校验求每段非负用量
+    的可行回绕圈数区间（某块表某段无解即以 ``no_solution`` 分段冲突返回，
+    不做后续联立）。各段漏损定义为总表用量减去各分表用量之和，且不得
+    为负：利用同模数下总表/分表圈数区间的**连续差值区间**求每段漏损的
+    可行范围（``w_i = k_主 − Σ k_分`` 为连续整数区间，可正可负），某段
+    即使取遍回绕组合总表用量仍小于分表用量之和时为
+    ``loss_segment_negative``。再由给定整期漏损总量
+    ``L = ΣD_i + M·Σw_i`` 联立：总量与 ``ΣD_i`` 不同余为
+    ``total_incompatible_modulus``，固定 ``W`` 后超出各段圈数差区间和为
+    ``total_out_of_range``。可行时以整数区间运算收紧各段 ``w_i``（与
+    ``/v1/usage/reconcile`` 同一收紧公式，允许负圈数差），仅在唯一时
+    给出确定漏损，其余段只给非负漏损上下界，**不枚举任何回绕组合**。
+    """
+    meta, timestamps, elapsed, matrix, raw_solutions = _meter_segments_for_loss(req)
+
+    def _meter_outs() -> List[LossMeterOut]:
+        outs = []
+        for m, (role, meter_index, name, rate_str, meter_model) in enumerate(meta):
+            segs = []
+            for i, (a, b) in enumerate(
+                zip(meter_model.readings, meter_model.readings[1:])
+            ):
+                seg = matrix[m][i]
+                min_usage, max_usage = seg.usage_bounds(req.modulus)
+                segs.append(
+                    LossMeterSegmentOut(
+                        index=i,
+                        start_timestamp=a.timestamp,
+                        end_timestamp=b.timestamp,
+                        start_reading=a.value,
+                        end_reading=b.value,
+                        elapsed_seconds=elapsed[i],
+                        min_wraps=seg.min_wraps,
+                        max_wraps=seg.max_wraps,
+                        min_usage=min_usage,
+                        max_usage=max_usage,
+                    )
+                )
+            outs.append(
+                LossMeterOut(
+                    role=role,  # type: ignore[arg-type]
+                    index=meter_index,
+                    name=name,
+                    max_rate_per_second=rate_str,
+                    segments=segs,
+                )
+            )
+        return outs
+
+    result = reconcile_master_sub_loss(matrix, req.total_loss, req.modulus)
+
+    if result.status == STATUS_CONFLICT:
+        conflicts: List[
+            Union[
+                LossMeterSegmentErrorOut,
+                LossSegmentNegativeErrorOut,
+                LossTotalErrorOut,
+            ]
+        ] = []
+        for reason in result.conflicts:
+            if reason == STATUS_NO_SOLUTION:
+                for m, (role, meter_index, name, _rate, meter_model) in enumerate(meta):
+                    label = (
+                        "总表"
+                        if role == "master"
+                        else f"分表[{meter_index}]"
+                        + (f"（{name}）" if name else "")
+                    )
+                    for i, (a, b) in enumerate(
+                        zip(meter_model.readings, meter_model.readings[1:])
+                    ):
+                        sol = raw_solutions[m][i]
+                        if sol.max_wraps >= sol.min_wraps:
+                            continue
+                        conflicts.append(
+                            LossMeterSegmentErrorOut(
+                                kind="meter_segment",
+                                role=role,  # type: ignore[arg-type]
+                                index=i,
+                                meter_index=meter_index,
+                                name=name,
+                                start_timestamp=a.timestamp,
+                                end_timestamp=b.timestamp,
+                                start_reading=a.value,
+                                end_reading=b.value,
+                                elapsed_seconds=elapsed[i],
+                                reason=STATUS_NO_SOLUTION,
+                                detail=(
+                                    f"{label}第 {i} 段"
+                                    + _no_solution_detail(
+                                        b.value - a.value,
+                                        req.modulus,
+                                        sol,
+                                        elapsed[i],
+                                    )
+                                ),
+                                min_wraps=sol.min_wraps,
+                                max_wraps=sol.max_wraps,
+                            )
+                        )
+            elif reason == REASON_LOSS_SEGMENT_NEGATIVE:
+                # 各段非负性在核心内逐段判定；重新定位全部不满足的段给出明细
+                master = matrix[0]
+                for i in range(len(elapsed)):
+                    d_i = master[i].diff - sum(
+                        matrix[m][i].diff for m in range(1, len(matrix))
+                    )
+                    raw_lo = master[i].min_wraps - sum(
+                        matrix[m][i].max_wraps for m in range(1, len(matrix))
+                    )
+                    raw_hi = master[i].max_wraps - sum(
+                        matrix[m][i].min_wraps for m in range(1, len(matrix))
+                    )
+                    # ceil(-d_i / M) 的精确整数计算（无浮点）：
+                    # 对整数 a、b>0 有 ceil(a/b) = -((-a)//b)，此处 a = -d_i、b = M，
+                    # 化简即 ceil(-d_i/M) = -(d_i // M)
+                    required_w = -(d_i // req.modulus)
+                    if raw_hi >= required_w:
+                        continue
+                    master_diff = master[i].diff
+                    sub_diff_sum = sum(
+                        matrix[m][i].diff for m in range(1, len(matrix))
+                    )
+                    master_lo_u, _ = master[i].usage_bounds(req.modulus)
+                    sub_lo_u = sub_diff_sum + sum(
+                        matrix[m][i].min_wraps * req.modulus
+                        for m in range(1, len(matrix))
+                    )
+                    conflicts.append(
+                        LossSegmentNegativeErrorOut(
+                            kind="loss_segment",
+                            index=i,
+                            start_timestamp=timestamps[i],
+                            end_timestamp=timestamps[i + 1],
+                            elapsed_seconds=elapsed[i],
+                            reason=REASON_LOSS_SEGMENT_NEGATIVE,
+                            detail=(
+                                f"第 {i} 段漏损无法非负：总表用量在任何回绕组合下"
+                                f"都不小于 {master_lo_u}（总表读数差 {master_diff}），"
+                                f"而各分表用量之和在该段至少为 {sub_lo_u}；"
+                                f"漏损 = D + w×M（D = {d_i}，w = 总表圈数 − Σ分表圈数，"
+                                f"可行 w ∈ [{raw_lo}, {raw_hi}]），非负漏损要求 "
+                                f"w >= {required_w}，区间无交（w 再大也受各表非负"
+                                f"用量与速率上限约束），该段必然存在负漏损"
+                            ),
+                            master_reading_diff=master_diff,
+                            sub_reading_diff_sum=sub_diff_sum,
+                            diff=d_i,
+                            min_wraps=raw_lo,
+                            max_wraps=raw_hi,
+                            required_min_wraps=required_w,
+                        )
+                    )
+            else:  # 总量类冲突
+                sum_diff = sum(
+                    matrix[0][i].diff
+                    - sum(matrix[m][i].diff for m in range(1, len(matrix)))
+                    for i in range(len(elapsed))
+                )
+                expected_remainder = sum_diff % req.modulus
+                if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                    detail = (
+                        f"整期漏损总量与模数不相容：总漏损 L 必须满足 "
+                        f"L ≡ {expected_remainder} (mod {req.modulus})"
+                        f"（各段总表读数差减分表读数差之和 ΣD = {sum_diff}），"
+                        f"收到 {req.total_loss}（余数 "
+                        f"{req.total_loss % req.modulus}），整期总表/分表"
+                        f"圈数差总和不是整数"
+                    )
+                    expected: Optional[int] = expected_remainder
+                    total_wraps: Optional[int] = None
+                else:  # REASON_TOTAL_OUT_OF_RANGE
+                    detail = (
+                        f"整期漏损总量超出可行范围：各表圈数均为非负整数且满足"
+                        f"各自速率上限、各段漏损非负时，整期漏损只能在 "
+                        f"[{result.feasible_min_total}, {result.feasible_max_total}]"
+                        f"（模数 {req.modulus}）内取与 ΣD 模 {req.modulus} 同余的"
+                        f"值，收到 {req.total_loss}"
+                    )
+                    expected = None
+                    total_wraps = result.total_wraps
+                conflicts.append(
+                    LossTotalErrorOut(
+                        kind="total",
+                        reason=reason,  # type: ignore[arg-type]
+                        detail=detail,
+                        feasible_min_total=result.feasible_min_total,
+                        feasible_max_total=result.feasible_max_total,
+                        expected_remainder=expected,
+                        total_wraps=total_wraps,
+                    )
+                )
+
+        return MasterSubLossResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_loss=req.total_loss,
+            total_wraps=result.total_wraps,
+            meters=_meter_outs(),
+            segments=[],
+            unique=False,
+            conflicts=conflicts,
+        )
+
+    # 可行：圈数差唯一的段给出确定漏损，其余只给非负范围，不猜测
+    segments: List[LossSegmentRangeOut] = []
+    for seg in result.segments:
+        i = seg.index
+        min_loss, max_loss = seg.loss_bounds(req.modulus)
+        master_min, master_max = matrix[0][i].usage_bounds(req.modulus)
+        sub_min = sum(
+            matrix[m][i].diff + matrix[m][i].min_wraps * req.modulus
+            for m in range(1, len(matrix))
+        )
+        sub_max = sum(
+            matrix[m][i].diff + matrix[m][i].max_wraps * req.modulus
+            for m in range(1, len(matrix))
+        )
+        segments.append(
+            LossSegmentRangeOut(
+                index=i,
+                start_timestamp=timestamps[i],
+                end_timestamp=timestamps[i + 1],
+                elapsed_seconds=elapsed[i],
+                min_loss=min_loss,
+                max_loss=max_loss,
+                unique=seg.unique,
+                loss=seg.loss(req.modulus),
+                master_usage_min=master_min,
+                master_usage_max=master_max,
+                sub_usage_min=sub_min,
+                sub_usage_max=sub_max,
+            )
+        )
+
+    return MasterSubLossResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        total_loss=req.total_loss,
+        total_wraps=result.total_wraps,
+        meters=_meter_outs(),
+        segments=segments,
+        unique=all(s.unique for s in result.segments),
+        conflicts=[],
     )

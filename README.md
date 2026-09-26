@@ -20,6 +20,8 @@
 
 还提供**异常采样清理**接口：输入模数、按时序的读数序列与非负每秒速率上限，把**任意两条**读数按时间差、非负增量与回绕模数判定可否相邻保留（复用逐段复核的同一精确速率运算）。**首尾读数必须保留**，在此前提下求**删除最少内部读数**的完整序列（有向无环图最长路径，`O(n²)`，**不枚举保留子序列**）；多组最优解按**保留索引序列字典序**选定，返回保留索引、删除索引与删除数；首末读数在该速率与模数约束下无法连通时返回明确的 `no_solution` 状态。
 
+另提供**总分表漏损复核**接口：输入**同一模数**的一块总表与**至少一块分表**（各表可有各自每秒速率上限），各表共用同一组严格递增的秒精度时间点并给出对应读数，以及给定的**整期漏损总量**。逐表复用现有读数与速率校验，求每段非负用量的可行回绕圈数区间；每段漏损定义为**总表用量减去各分表用量之和，且不得为负**。利用同模数下总表/分表圈数区间的**连续差值区间**求每段可行漏损范围，再由整期漏损总量联立收紧各段范围（整数区间运算，**不枚举回绕组合**）；仅在唯一时给出确定漏损，其余段只给非负漏损上下界。**单表无解、单段漏损无法非负、总量同余冲突与总量超界**分别给出可区分的冲突原因。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -37,6 +39,7 @@ docker compose up --build
 - 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
 - 最小统一速率上限：`POST http://localhost:8000/v1/usage/minimum-rate`
 - 双表同段交叉核验：`POST http://localhost:8000/v1/usage/dual-meter/compare`
+- 总分表漏损复核：`POST http://localhost:8000/v1/usage/master-sub/loss-reconcile`
 - 分时单价账单金额区间：`POST http://localhost:8000/v1/billing/charge-range`
 - 异常采样清理：`POST http://localhost:8000/v1/usage/clean-readings`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
@@ -1261,6 +1264,183 @@ pytest
 - 无解时 `kept_indices` / `removed_indices` 为空、`removed_count` 为 `null`，`detail` 给出明确说明，**不编造删除方案**。
 - 请求校验错误（读数越界、时间不递增、缺时区、含亚秒、读数不足 2 条、负速率、模数 < 1 等）返回 `422`，与 `/v1/usage/verify` 完全一致。
 
+### `POST /v1/usage/master-sub/loss-reconcile`
+
+总分表漏损复核。输入**同一模数**的一块总表（`master`）与**至少一块分表**（`sub_meters`），各表共用**同一组**秒精度、带时区且严格递增的时间点（读数条数相同、同位置时刻换算 UTC 后必须一致），并给出各表对应的读数与各自的每秒速率上限（速率可各表不同），以及给定的整期漏损总量 `total_loss`。读数、时间戳、模数、速率的校验规则与其他接口完全一致（复用 `Reading` 同一时间戳校验）。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "total_loss": 600,
+  "master": {
+    "name": "总表",
+    "max_rate_per_second": 100,
+    "readings": [
+      { "timestamp": "2026-09-24T00:00:00Z", "value": 0 },
+      { "timestamp": "2026-09-24T00:00:10Z", "value": 600 },
+      { "timestamp": "2026-09-24T00:00:20Z", "value": 200 }
+    ]
+  },
+  "sub_meters": [
+    {
+      "name": "分表A",
+      "max_rate_per_second": 100,
+      "readings": [
+        { "timestamp": "2026-09-24T00:00:00Z", "value": 0 },
+        { "timestamp": "2026-09-24T00:00:10Z", "value": 500 },
+        { "timestamp": "2026-09-24T00:00:20Z", "value": 600 }
+      ]
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `modulus` | 整数 | `>= 1`，总表与各分表**共用同一**计数器模数 |
+| `total_loss` | 整数 | `>= 0`，给定的整期漏损总量 |
+| `master` / `sub_meters[].max_rate_per_second` | 数值 | `>= 0`，该表每秒速率上限（支持小数，精确分数计算）；各表可不同 |
+| `master` / `sub_meters[].name` | 字符串 | 可选，仅用于结果标识；缺省为 `null` |
+| `master` / `sub_meters[].readings` | 数组 | 至少 2 条；各表**读数条数相同**，同位置时刻换算 UTC 后必须**完全一致**；表内时刻严格递增，`0 <= value < modulus` |
+| `sub_meters` | 数组 | **至少一块**分表 |
+
+**响应（各段漏损唯一，`200`，`status = "ok"`）**
+
+上例总表两段用量均为 `600`（第二段 `600 → 200` 回绕 1 圈：`-400 + 1000`），分表两段用量为 `500`、`100`，故段漏损为 `100`、`500`，整期恰为 `600`：
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_loss": 600,
+  "total_wraps": 1,
+  "meters": [
+    {
+      "role": "master",
+      "index": null,
+      "name": "总表",
+      "max_rate_per_second": "100",
+      "segments": [
+        { "index": 0, "start_timestamp": "2026-09-24T00:00:00Z", "end_timestamp": "2026-09-24T00:00:10Z",
+          "start_reading": 0, "end_reading": 600, "elapsed_seconds": 10,
+          "min_wraps": 0, "max_wraps": 0, "min_usage": 600, "max_usage": 600 },
+        { "index": 1, "start_timestamp": "2026-09-24T00:00:10Z", "end_timestamp": "2026-09-24T00:00:20Z",
+          "start_reading": 600, "end_reading": 200, "elapsed_seconds": 10,
+          "min_wraps": 1, "max_wraps": 1, "min_usage": 600, "max_usage": 600 }
+      ]
+    },
+    {
+      "role": "sub",
+      "index": 0,
+      "name": "分表A",
+      "max_rate_per_second": "100",
+      "segments": [
+        { "index": 0, "start_reading": 0, "end_reading": 500, "elapsed_seconds": 10,
+          "min_wraps": 0, "max_wraps": 0, "min_usage": 500, "max_usage": 500 },
+        { "index": 1, "start_reading": 500, "end_reading": 600, "elapsed_seconds": 10,
+          "min_wraps": 0, "max_wraps": 0, "min_usage": 100, "max_usage": 100 }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:00:10Z",
+      "elapsed_seconds": 10,
+      "min_loss": 100,
+      "max_loss": 100,
+      "unique": true,
+      "loss": 100,
+      "master_usage_min": 600,
+      "master_usage_max": 600,
+      "sub_usage_min": 500,
+      "sub_usage_max": 500
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:00:10Z",
+      "end_timestamp": "2026-09-24T00:00:20Z",
+      "elapsed_seconds": 10,
+      "min_loss": 500,
+      "max_loss": 500,
+      "unique": true,
+      "loss": 500,
+      "master_usage_min": 600,
+      "master_usage_max": 600,
+      "sub_usage_min": 100,
+      "sub_usage_max": 100
+    }
+  ],
+  "unique": true,
+  "conflicts": []
+}
+```
+
+- `meters`：总表（`role = "master"`，`index = null`）与各分表（`role = "sub"`，`index` 为其在 `sub_meters` 中的下标，按下标升序）各自在**联立总量前**的独立可行圈数/用量范围（字段同其他接口的分段范围）。
+- `segments`：整期漏损总量联立后各段漏损。`unique = true`（`min_loss == max_loss`）时 `loss` 给出确定漏损、`min_loss` / `max_loss` 与其相等；仍有多解时 `loss` 为 `null`，只给非负漏损上下界，**不猜测**。
+- `master_usage_min/max`、`sub_usage_min/max`：该段总表用量与各分表用量之和的独立可行范围（联立前）；漏损界是在「总表取大、分表取小」等组合下的精确可达界。
+- `total_wraps`：整期总表与分表圈数差总和 `W = (total_loss − ΣD_i) / modulus`（`D_i` 为该段总表读数差减各分表读数差之和；`W` 可正可负，为负表示整期分表累计圈数更多但各段漏损仍可非负）。
+- 所有可行组合的各段漏损之和恒等于 `total_loss`，故**交叉端点相等**：某段漏损下界 + 其余段漏损上界 = 整期总量。
+
+**仍有多解（`unique = false`）的情形**：总表读数 `100 → 200 → 100`、分表 `0 → 500 → 0`（各段均 1000s、速率均为 10），整期漏损 `2000` 时两段漏损分别为 `[600, 1600]`、`[400, 1400]`（可行组合 `(600, 1400)` 与 `(1600, 400)`，和恒为 `2000`）；整期漏损取可行端点 `1000` 或 `18000` 时两段全部唯一。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+四类冲突原因可区分（按校验先后）：
+
+1. **单表无解**（`kind = "meter_segment"`，`reason = "no_solution"`）：某块表的某段在非负增量 / 该表速率上限下原本无解（复用逐段判定）；`role` 为 `master` / `sub`，分表另给 `meter_index`，多块分表可定位。存在该冲突时不再进行漏损联立，`segments` 为空；`meters` 仍照常返回以便排查。
+
+   ```json
+   {
+     "kind": "meter_segment",
+     "role": "master",
+     "index": 0,
+     "meter_index": null,
+     "name": "总表",
+     "reason": "no_solution",
+     "detail": "总表第 0 段无解：无解：最可能增量 600 已超出该区间 10s 内允许的最大增量 10（k 需同时满足 k>=0 与 k<=-1，区间为空）",
+     "min_wraps": 0,
+     "max_wraps": -1
+   }
+   ```
+
+2. **单段漏损无法非负**（`kind = "loss_segment"`，`reason = "loss_segment_negative"`）：该段总表在任何回绕组合下的最小用量仍小于各分表用量之和的最小值。响应给出该段读数差 `D_i`（`diff = master_reading_diff − sub_reading_diff_sum`）、圈数差 `w_i = k_主 − Σk_分` 的连续可行区间 `[min_wraps, max_wraps]` 与非负漏损要求的下界 `required_min_wraps = ceil(−D_i / M)`（后者大于上界即无解）。
+
+   ```json
+   {
+     "kind": "loss_segment",
+     "index": 0,
+     "reason": "loss_segment_negative",
+     "master_reading_diff": 100,
+     "sub_reading_diff_sum": 500,
+     "diff": -400,
+     "min_wraps": 0,
+     "max_wraps": 0,
+     "required_min_wraps": 1
+   }
+   ```
+
+3. **总量同余冲突**（`kind = "total"`，`reason = "total_incompatible_modulus"`）：整期漏损 `L` 必须满足 `L ≡ ΣD_i (mod modulus)`；`expected_remainder` 给出应有余数，`total_wraps` 为 `null`。
+
+4. **总量超界**（`kind = "total"`，`reason = "total_out_of_range"`）：同余成立但 `W` 超出各段非负圈数差区间之和；`feasible_min_total` / `feasible_max_total` 给出整期可行漏损的上下界（各段非负漏损下界/上界之和），`total_wraps` 给出该总量隐含的 `W`。
+
+   ```json
+   {
+     "kind": "total",
+     "reason": "total_out_of_range",
+     "detail": "整期漏损总量超出可行范围：……整期漏损只能在 [1000, 18000]（模数 1000）内取与 ΣD 模 1000 同余的值，收到 0",
+     "feasible_min_total": 1000,
+     "feasible_max_total": 18000,
+     "expected_remainder": null,
+     "total_wraps": 0
+   }
+   ```
+
+冲突优先级：先逐表判单表无解（列出全部无解段），再逐段判漏损非负，最后才做整期同余与超界校验。请求校验错误（各表读数条数不一致、同位置时刻不同、读数越界、表内时间不递增、缺时区、含亚秒、分表数为 0、负速率、`total_loss` 为负或非整数、模数 < 1 等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -1500,12 +1680,55 @@ dist[q] = dist[cur] + 1  且  dist[q] + tail[q] = D
 
 即该步既要走出最长路的一步，又要保证剩余部分仍是最优的。最长路上的点必存在这样的后继，故重构不会中断；每步取最小索引，归纳可得完整序列为所有最优解中**保留索引序列字典序最小**者（序列等长，逐位比较，等价于尽早保留较小的索引）。逐对可行性判定与两遍 DP 均为 `O(n²)`，与读数可能涉及的回绕次数区间大小无关；速率上限仍由 `Fraction` 精确取整，无浮点边界误差。
 
+### 总分表漏损复核
+
+一块总表（下标 0）与 `m >= 1` 块分表共用同一模数 `M` 与同一组时刻，各表在段 `i` 的真实用量为
+
+```
+u_{t,i} = d_{t,i} + k_{t,i}·M
+```
+
+其中 `d_{t,i}` 为该表该段读数差，`k_{t,i}` 为落在非负增量与该表速率上限所夹连续整数区间 `[kmin_{t,i}, kmax_{t,i}]` 内的非负整圈数（逐表复用 `solve_segment` 求得，任一表段 `kmax < kmin` 即单表无解）。第 `i` 段漏损为**总表用量减去各分表用量之和**：
+
+```
+l_i = u_{0,i} − Σ_{t>=1} u_{t,i}
+    = D_i + w_i·M
+D_i = d_{0,i} − Σ_{t>=1} d_{t,i}
+w_i = k_{0,i} − Σ_{t>=1} k_{t,i}
+```
+
+各表圈数在同一时段相互独立地取各自连续整数区间，故 `w_i` 的可行集是这些区间和的**连续差值区间**：
+
+```
+lo_i^0 = kmin_{0,i} − Σ_{t>=1} kmax_{t,i}
+hi_i^0 = kmax_{0,i} − Σ_{t>=1} kmin_{t,i}
+```
+
+（总表取 + 区间、分表取 − 区间；`w_i` 允许为负，不要求总表圈数不少于分表。）漏损不得为负，即 `D_i + w_i·M >= 0`，故进一步要求 `w_i >= ceil(−D_i / M)`：与 `[lo_i^0, hi_i^0]` 无交（`hi_i^0 < ceil(−D_i/M)`）即该段漏损无法非负（`loss_segment_negative`），与单表无解、总量类冲突均不同。记收紧后的区间为 `[lo_i, hi_i]`，则该段可行漏损为连续整数区间 `[D_i + lo_i·M, D_i + hi_i·M]`，端点均可达到。
+
+整期漏损总量 `L` 要求
+
+```
+L = Σ l_i = Σ D_i + M · Σ w_i = Σ D_i + M · W
+```
+
+`L − ΣD_i` 不被 `M` 整除即**总量同余冲突**（`total_incompatible_modulus`）；固定 `W = (L − ΣD_i)/M` 后要求 `Σ lo_i <= W <= Σ hi_i`，否则**总量超界**（`total_out_of_range`，可行整期漏损区间即各段漏损界之和）。`W` 与 `w_i` 均允许负值，故非负性只由每段漏损约束承担，不另加圈数差非负条件。
+
+固定 `W` 后各段圈数差由与「账单总量对账」**完全相同的整数区间收紧公式**给出（区间可含负值，公式不变）：
+
+```
+lo_i' = max(lo_i, W − Σ_{j≠i} hi_j)
+hi_i' = min(hi_i, W − Σ_{j≠i} lo_j)
+```
+
+`lo_i' == hi_i'` 的段漏损唯一、给出确定值，其余段只给非负漏损上下界。由于各段 `w_i` 相互独立，任何满足 `w_i ∈ [lo_i', hi_i']`、`Σw_i = W` 的整数组合都可由各表圈数独立取值实现（总表取 `k_0`、分表取 `k_t` 使差值为指定 `w_i` 即可），因此段漏损端点均确实可达，且交叉端点相等：段 `i` 漏损下界与其余段漏损上界之和恰为 `L`。全程仅整数区间运算与一次整除，**不枚举任何回绕组合**，计算量只取决于表数与段数，与圈数区间大小无关。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立、分时单价金额贪心极值与异常采样清理（DAG 最长路径 + 保留索引字典序选定）（Fraction/整数精确计算）
+  core.py   # 回绕次数判定、总量对账、停水裁剪合并与供水片段容量、换表丢番图联立、跨日子段界、漏采读数候选区间、最小统一速率门槛、双表同余联立、分时单价金额贪心极值、异常采样清理（DAG 最长路径 + 保留索引字典序选定）与总分表漏损复核（同模数圈数区间连续差值 + 整期总量整数收紧）（Fraction/整数精确计算）
 tests/
   test_api.py
 Dockerfile

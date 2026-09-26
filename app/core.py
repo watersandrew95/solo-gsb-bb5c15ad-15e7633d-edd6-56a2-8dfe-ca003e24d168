@@ -126,6 +126,26 @@
     步取满足 dist[q] = dist[cur]+1 且 dist[q]+tail[q] = D 的最小后继
     q（最长路上的点必有这样的最优后继），归纳得到字典序最小的完整序
     列。逐对判定与 DP 均为 O(n²)，不枚举保留子序列。
+
+总分表漏损复核（reconcile_master_sub_loss）：
+    同一模数 M 的一块总表与至少一块分表共用同一组严格递增时刻，各表
+    在每段的真实用量 u_{m,i} = d_{m,i} + k_{m,i}*M（k 为非负整圈数）。
+    逐表复用 solve_segment 求出每段可行圈数区间（单表单段无解即
+    no_solution）。第 i 段漏损
+        l_i = u_{主,i} - Σ_m u_{分,m,i} = D_i + w_i*M
+    其中 D_i = d_{主,i} - Σ d_{分,i}，w_i = k_{主,i} - Σ k_{分,m,i}
+    为该段总表与分表圈数之差（可正可负，不必非负）。非负漏损要求
+    w_i >= ceil(-D_i / M)，与各表圈数区间的连续差值区间
+    [Σk_min 差, Σk_max 差] 求交；交集为空即该段漏损无法非负
+    （loss_segment_negative）。整期漏损总量 L 要求
+        L = Σ l_i = Σ D_i + M * Σ w_i
+    L - ΣD_i 不被 M 整除即总量同余冲突（total_incompatible_modulus）；
+    固定 W = (L - ΣD_i)/M 后，各段 w_i 独立取各自连续整数区间且
+    Σ w_i = W，与 reconcile_total 完全相同的整数区间收紧公式（此处
+    w_i 允许负值）；Σlo <= W <= Σhi 不成立即总量超界
+    （total_out_of_range）。收紧后 lo_i == hi_i 的段漏损唯一、给出
+    确定值，其余段只给漏损上下界（端点均可达到，交叉端点相等），不
+    枚举任何回绕组合。
 """
 
 from __future__ import annotations
@@ -153,6 +173,8 @@ REASON_INSUFFICIENT_CAPACITY = "insufficient_capacity"
 REASON_INCOMPATIBLE_MODULUS = "incompatible_modulus"
 # 同余相容但两表可行用量范围之交内没有共同候选
 REASON_RANGE_DISJOINT = "range_disjoint"
+# 总分表漏损复核冲突原因：某段总表用量恒小于各分表用量之和，漏损无法非负
+REASON_LOSS_SEGMENT_NEGATIVE = "loss_segment_negative"
 
 
 @dataclass(frozen=True)
@@ -1515,4 +1537,250 @@ def clean_readings(
         status=STATUS_OK,
         kept_indices=tuple(kept),
         removed_indices=removed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 总分表漏损复核（master-sub loss）：总表用量减去各分表用量之和，逐段非负漏损
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LossMeterSegment:
+    """某块表（总表或某块分表）在某段上的读数差与可行回绕次数整数区间。"""
+
+    diff: int
+    min_wraps: int
+    max_wraps: int  # 小于 min_wraps 表示该表单段无解（不满足非负增量或超速）
+
+    @property
+    def feasible(self) -> bool:
+        return self.max_wraps >= self.min_wraps
+
+    def usage_bounds(self, modulus: int) -> Tuple[int, int]:
+        """该表该段用量的最小/最大可能值。"""
+        return (
+            self.diff + self.min_wraps * modulus,
+            self.diff + self.max_wraps * modulus,
+        )
+
+
+@dataclass(frozen=True)
+class LossSegment:
+    """整期漏损总量联立后，单段漏损与总表/分表圈数差的收紧结果。"""
+
+    index: int
+    diff: int  # D_i = 总表读数差 - Σ 分表读数差
+    min_wraps: int  # 非负漏损与总量联立后 w_i = k_主 - Σk_分 的下界（可负）
+    max_wraps: int  # w_i 的上界（可负）
+
+    @property
+    def unique(self) -> bool:
+        """该段漏损（圈数差）是否已被总量唯一确定。"""
+        return self.min_wraps == self.max_wraps
+
+    @property
+    def wraps(self) -> Optional[int]:
+        return self.min_wraps if self.unique else None
+
+    def loss(self, modulus: int) -> Optional[int]:
+        """圈数差唯一时该段确定漏损，否则为 None。"""
+        return self.diff + self.min_wraps * modulus if self.unique else None
+
+    def loss_bounds(self, modulus: int) -> Tuple[int, int]:
+        """该段漏损的最小/最大可能值（端点均可达到，均非负）。"""
+        return (
+            self.diff + self.min_wraps * modulus,
+            self.diff + self.max_wraps * modulus,
+        )
+
+
+@dataclass(frozen=True)
+class NegativeLossSegment:
+    """某段总表用量恒小于各分表用量之和（漏损无法非负）的冲突明细。"""
+
+    index: int
+    diff: int  # D_i
+    # 各表圈数区间连续差值给出的 w_i 范围（尚未施加非负漏损约束，可含负值）
+    min_wraps: int
+    max_wraps: int
+    required_min_wraps: int  # 非负漏损要求的 w_i 下界 ceil(-D_i / M)
+
+
+@dataclass(frozen=True)
+class MasterSubLossResult:
+    """总分表漏损复核结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]
+    # 各表各段的独立判定结果：meters[0] 为总表，其余为分表（与输入同序）；
+    # 段顺序即相邻时刻段顺序。存在单表无解冲突时其余结构仍照常给出
+    meters: Tuple[Tuple[LossMeterSegment, ...], ...]
+    # 总量联立收紧后的各段漏损；冲突时为空
+    segments: Tuple[LossSegment, ...]
+    total_wraps: Optional[int]  # 整期圈数差总和 W = (L - ΣD_i)/M；同余冲突时为 None
+    feasible_min_total: int  # 各段漏损下界之和（整期可行漏损下界）
+    feasible_max_total: int  # 各段漏损上界之和（整期可行漏损上界）
+
+
+def reconcile_master_sub_loss(
+    meter_segments: Sequence[Sequence[LossMeterSegment]],
+    total_loss: int,
+    modulus: int,
+) -> MasterSubLossResult:
+    """以整期漏损总量联立总分表读数，精确收紧各段漏损范围，不枚举回绕组合。
+
+    总表 ``meter_segments[0]`` 与若干分表 ``meter_segments[1:]`` 共用同一
+    模数 ``modulus``，且各表段数相同（每段对应同一对相邻时刻）。表 ``m``
+    在段 ``i`` 的真实用量为 ``u_{m,i} = d_{m,i} + k_{m,i}*M``，调用方需
+    先以 :func:`solve_segment` 求出各表各段可行圈数区间；``max_wraps <
+    min_wraps`` 表示该表单段本身无解。
+
+    判定顺序（四类冲突原因可区分）：
+
+    1. **单表无解**（``no_solution``）：任一表的任一段不满足非负增量/
+       速率上限，直接冲突，不做后续联立。
+    2. **单段漏损无法非负**（``loss_segment_negative``）：段漏损
+       ``l_i = u_主,i - Σ_m u_分,i = D_i + w_i*M``，其中
+       ``D_i = d_主,i - Σ d_分,i``、``w_i = k_主,i - Σ k_分,m,i``。
+       各表圈数独立取其连续整数区间，故 ``w_i`` 的可行范围为连续整数
+       区间 ``[lo_i^0, hi_i^0]``（总表取 + 区间、分表取 − 区间）；非负
+       漏损要求 ``w_i >= ceil(-D_i/M)``，与该区间无交即该段总表用量在
+       任何回绕组合下都小于分表用量之和。
+    3. **总量同余冲突**（``total_incompatible_modulus``）：整期漏损
+       ``L = Σ l_i = Σ D_i + M·W``（``W = Σ w_i``，为各表整期圈数差，
+       可正可负），故 ``L - ΣD_i`` 必须被 ``M`` 整除。
+    4. **总量超界**（``total_out_of_range``）：固定
+       ``W = (L - ΣD_i)/M`` 后要求 ``Σ lo_i^0 <= W <= Σ hi_i^0``；
+       否则没有任何回绕组合的整期漏损等于 L。
+
+    可行时各段 ``w_i`` 在 ``w_i ∈ [lo_i^0, hi_i^0]``、``Σ w_i = W`` 下
+    由与 :func:`reconcile_total` 相同的整数区间公式收紧（区间允许负值，
+    公式不变）：
+
+        lo_i' = max(lo_i^0, W - Σ_{j≠i} hi_j^0)
+        hi_i' = min(hi_i^0, W - Σ_{j≠i} lo_j^0)
+
+    ``lo_i' == hi_i'`` 的段漏损唯一，给出确定值；其余段只给漏损上下界。
+    各段圈数差相互独立（各表圈数独立取值即可实现任意 ``w_i`` 组合），
+    故端点均可达到且交叉端点相等：段下界之和与段上界之和在总量约束下
+    此消彼长，均等于 L。
+
+    :param total_loss: 给定的整期漏损总量（非负整数）
+    """
+    if not meter_segments:
+        raise ValueError("至少需要总表一块表")
+    if len(meter_segments) < 2:
+        raise ValueError("至少需要一块分表")
+    seg_count = len(meter_segments[0])
+    if seg_count < 1:
+        raise ValueError("至少需要一段读数区间")
+    if any(len(segs) != seg_count for segs in meter_segments):
+        raise ValueError("总表与各分表的段数必须一致（共用同一组时刻）")
+
+    meters = tuple(tuple(segs) for segs in meter_segments)
+
+    def _result(
+        conflicts: Sequence[str],
+        segments: Sequence[LossSegment] = (),
+        total_wraps: Optional[int] = None,
+        feasible_min_total: int = 0,
+        feasible_max_total: int = 0,
+    ) -> MasterSubLossResult:
+        return MasterSubLossResult(
+            status=STATUS_CONFLICT if conflicts else STATUS_OK,
+            conflicts=tuple(conflicts),
+            meters=meters,
+            segments=tuple(segments),
+            total_wraps=total_wraps,
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    # 1) 单表单段无解（不满足非负增量/速率上限）：直接冲突
+    if any(not seg.feasible for segs in meters for seg in segs):
+        return _result([STATUS_NO_SOLUTION])
+
+    # 2) 各段圈数差 w_i = k_主 - Σ k_分 的连续差值区间，并施加非负漏损约束
+    base_lows: list = []
+    base_highs: list = []
+    negative: list = []
+    for i in range(seg_count):
+        master_seg = meters[0][i]
+        d_i = master_seg.diff - sum(segs[i].diff for segs in meters[1:])
+        raw_lo = master_seg.min_wraps - sum(
+            segs[i].max_wraps for segs in meters[1:]
+        )
+        raw_hi = master_seg.max_wraps - sum(
+            segs[i].min_wraps for segs in meters[1:]
+        )
+        required = _ceil_div(-d_i, modulus)  # D_i + w*M >= 0 的最小整数 w
+        lo, hi = max(raw_lo, required), raw_hi
+        if hi < required:
+            negative.append(
+                NegativeLossSegment(
+                    index=i,
+                    diff=d_i,
+                    min_wraps=raw_lo,
+                    max_wraps=raw_hi,
+                    required_min_wraps=required,
+                )
+            )
+        base_lows.append(lo)
+        base_highs.append(hi)
+
+    if negative:
+        return _result([REASON_LOSS_SEGMENT_NEGATIVE])
+
+    diffs = [
+        meters[0][i].diff - sum(segs[i].diff for segs in meters[1:])
+        for i in range(seg_count)
+    ]
+    feasible_min_total = sum(
+        d + lo * modulus for d, lo in zip(diffs, base_lows)
+    )
+    feasible_max_total = sum(
+        d + hi * modulus for d, hi in zip(diffs, base_highs)
+    )
+
+    # 3) 整期漏损总量的模 M 同余校验（W 可为负：分表圈数总和超过总表并不矛盾）
+    numerator = total_loss - sum(diffs)
+    if numerator % modulus != 0:
+        return _result(
+            [REASON_TOTAL_INCOMPATIBLE_MODULUS],
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    total_wraps = numerator // modulus
+    sum_low, sum_high = sum(base_lows), sum(base_highs)
+    if not (sum_low <= total_wraps <= sum_high):
+        return _result(
+            [REASON_TOTAL_OUT_OF_RANGE],
+            total_wraps=total_wraps,
+            feasible_min_total=feasible_min_total,
+            feasible_max_total=feasible_max_total,
+        )
+
+    # 4) W 固定：与 reconcile_total 相同的整数区间收紧（允许负圈数差）
+    narrowed = []
+    for i in range(seg_count):
+        lo, hi = base_lows[i], base_highs[i]
+        new_lo = max(lo, total_wraps - (sum_high - hi))
+        new_hi = min(hi, total_wraps - (sum_low - lo))
+        narrowed.append(
+            LossSegment(
+                index=i,
+                diff=diffs[i],
+                min_wraps=new_lo,
+                max_wraps=new_hi,
+            )
+        )
+
+    return _result(
+        [],
+        segments=narrowed,
+        total_wraps=total_wraps,
+        feasible_min_total=feasible_min_total,
+        feasible_max_total=feasible_max_total,
     )
