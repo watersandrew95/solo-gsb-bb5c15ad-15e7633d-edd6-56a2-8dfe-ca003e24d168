@@ -18,6 +18,7 @@ from app.core import (
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
+    solve_loss_segment,
     solve_minimum_rate,
     solve_missing_reading,
     solve_outage_segment,
@@ -3191,3 +3192,667 @@ def test_clean_readings_exact_by_brute_force():
             assert body["removed_count"] + len(body["kept_indices"]) == n
         checked += 1
     assert checked > 1000
+
+
+# ---------------------------------------------------------------------------
+# 总分表漏损复核 /v1/usage/master-sub-meters/loss-reconcile
+# ---------------------------------------------------------------------------
+
+LOSS_PATH = "/v1/usage/master-sub-meters/loss-reconcile"
+
+
+def _loss(payload):
+    return _post(payload, path=LOSS_PATH)
+
+
+def _loss_payload(
+    total_loss,
+    master_values,
+    sub_values,
+    master_rate=100,
+    sub_rates=None,
+    modulus=1000,
+    step=10,
+    start="2026-09-24T00:00:00Z",
+    names=False,
+):
+    """按等距秒级时间点构造总分表漏损请求；sub_values 为各分表读数列表的列表。"""
+    from datetime import datetime, timedelta
+
+    t0 = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    timestamps = [
+        (t0 + timedelta(seconds=step * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for i in range(len(master_values))
+    ]
+    if sub_rates is None:
+        sub_rates = [master_rate] * len(sub_values)
+    subs = []
+    for j, (vals, rate) in enumerate(zip(sub_values, sub_rates)):
+        meter = {"max_rate_per_second": rate, "values": vals}
+        if names:
+            meter["name"] = f"分表{j}"
+        subs.append(meter)
+    master = {"max_rate_per_second": master_rate, "values": master_values}
+    if names:
+        master["name"] = "总表甲"
+    return {
+        "modulus": modulus,
+        "total_loss": total_loss,
+        "timestamps": timestamps,
+        "master_meter": master,
+        "sub_meters": subs,
+    }
+
+
+def test_loss_reconcile_all_unique():
+    """各表每段圈数均唯一：直接逐段给出确定漏损，整期之和等于总量。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[100, 600],
+            sub_values=[[0, 300], [900, 100]],  # 分表用量 300 与 200，总表 500
+            master_rate=100,
+            sub_rates=[100, 100],
+        )
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_loss"] == 0
+    assert body["total_net_wraps"] == -1  # ΣD=1000，(0-1000)/1000 = -1
+    assert body["unique"] is True
+    assert len(body["segments"]) == 1
+    seg = body["segments"][0]
+    assert seg["loss"] == 0
+    assert seg["net_wraps"] == -1  # 总表 k=0、分表 k 之和 0+1=1
+    assert seg["min_loss"] is None and seg["max_loss"] is None
+    assert (seg["master_usage_min"], seg["master_usage_max"]) == (500, 500)
+    assert (seg["sub_usage_min"], seg["sub_usage_max"]) == (500, 500)
+    assert seg["sub_start_readings"] == [0, 900]
+    assert seg["sub_end_readings"] == [300, 100]
+    assert seg["reading_diff"] == 1000
+    assert seg["required_net_wraps"] == -1
+    assert body["conflicts"] == []
+
+
+def test_loss_reconcile_multi_segment_unique():
+    """两段均唯一：漏损分别为 50 与 0，整期总量 50。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=50,
+            master_values=[0, 500, 200],
+            sub_values=[[0, 450, 150]],
+            master_rate=100,
+            step=10,
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert body["unique"] is True
+    assert [s["loss"] for s in body["segments"]] == [50, 0]
+    assert sum(s["loss"] for s in body["segments"]) == 50
+
+
+def test_loss_reconcile_ambiguous_then_total_narrows_unique():
+    """单段各表圈数均多解；整期总量把净圈数夹到唯一值。"""
+    # 3600s、速率 10：总表 diff=500 圈数 0..35，分表 diff=200 圈数 0..35；
+    # 净圈数 w 取 [-35,35]，非负收紧后 [0,35]，漏损 = 300 + w*1000
+    resp = _loss(
+        _loss_payload(
+            total_loss=5300,
+            master_values=[0, 500],
+            sub_values=[[0, 200]],
+            master_rate=10,
+            step=3600,
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert body["total_net_wraps"] == 5
+    assert body["unique"] is True
+    seg = body["segments"][0]
+    assert seg["net_wraps"] == 5
+    assert seg["loss"] == 5300
+
+
+def test_loss_reconcile_ambiguous_keeps_range():
+    """总量联立后净圈数仍有多解：只给漏损范围，交叉端点之和等于总量。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=3000,
+            master_values=[0, 500, 0],
+            sub_values=[[0, 200, 0]],
+            master_rate=10,
+            step=3600,
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert body["total_net_wraps"] == 3
+    assert body["unique"] is False
+    s0, s1 = body["segments"]
+    # 段0：D=300，w 收紧到 [0,2]；段1：D=-300，w 收紧到 [1,3]
+    assert (s0["min_net_wraps"], s0["max_net_wraps"]) == (0, 2)
+    assert (s1["min_net_wraps"], s1["max_net_wraps"]) == (1, 3)
+    assert s0["loss"] is None and s1["loss"] is None
+    assert (s0["min_loss"], s0["max_loss"]) == (300, 2300)
+    assert (s1["min_loss"], s1["max_loss"]) == (700, 2700)
+    # 交叉端点之和恒等于整期总量
+    assert s0["min_loss"] + s1["max_loss"] == 3000
+    assert s0["max_loss"] + s1["min_loss"] == 3000
+
+
+def test_loss_reconcile_zero_total_flat_readings():
+    """平读数、漏损总量 0：各表零圈、零漏损且唯一。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[123, 123, 123],
+            sub_values=[[50, 50, 50], [73, 73, 73]],
+            master_rate=0,
+            sub_rates=[0, 0],
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert body["unique"] is True
+    assert [s["loss"] for s in body["segments"]] == [0, 0]
+    assert all(s["net_wraps"] == 0 for s in body["segments"])
+
+
+def test_loss_reconcile_modulus_one():
+    """模数 1：读数恒为 0，漏损只能为 0。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[0, 0, 0],
+            sub_values=[[0, 0, 0]],
+            modulus=1,
+            master_rate=5,
+            step=10,
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "ok"
+    assert all(s["loss"] == 0 for s in body["segments"])
+
+
+def test_loss_reconcile_meter_no_solution():
+    """某分表某段超速无解：kind=meter 冲突，标明分表下标，不做漏损联立。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[0, 50],
+            sub_values=[[0, 200]],  # 10s 容量 100，200 无解
+            master_rate=10,
+            sub_rates=[10],
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["total_net_wraps"] is None
+    cf = body["conflicts"]
+    assert len(cf) == 1
+    assert cf[0]["kind"] == "meter"
+    assert cf[0]["meter_role"] == "sub"
+    assert cf[0]["sub_index"] == 0
+    assert cf[0]["meter_name"] == "sub-0"
+    assert cf[0]["reason"] == "no_solution"
+    assert cf[0]["min_wraps"] == 0 and cf[0]["max_wraps"] == -1
+
+
+def test_loss_reconcile_master_no_solution():
+    """总表段无解：meter_role=master、sub_index=null。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[900, 800],  # 1s 容量 1，最小增量 900，无解
+            sub_values=[[0, 0]],
+            master_rate=1,
+            sub_rates=[1],
+            step=1,
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    cf = body["conflicts"]
+    assert len(cf) == 1
+    assert cf[0]["kind"] == "meter"
+    assert cf[0]["meter_role"] == "master"
+    assert cf[0]["sub_index"] is None
+    assert cf[0]["meter_name"] == "master"
+    assert cf[0]["reason"] == "no_solution"
+
+
+def test_loss_reconcile_multiple_meter_conflicts_listed():
+    """总表与分表在不同段均无解时一并列出，按段、按表角色排序。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[900, 800, 0],  # 段0无解；段1 800->0 容量1，同样无解
+            sub_values=[[0, 0, 0]],       # 分表全平读数，两段均可行
+            master_rate=1,
+            sub_rates=[1],
+            step=1,
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    cfs = body["conflicts"]
+    # 总表两段都无解（按段索引升序），分表无冲突
+    assert [(c["index"], c["meter_role"]) for c in cfs] == [
+        (0, "master"),
+        (1, "master"),
+    ]
+
+
+def test_loss_reconcile_master_and_sub_conflicts_in_same_segment():
+    """同一段内总表与分表都无解时两者一并列出（先总表后分表）。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[900, 800],
+            sub_values=[[0, 900]],
+            master_rate=1,
+            sub_rates=[1],
+            step=1,
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    cfs = body["conflicts"]
+    assert [(c["index"], c["meter_role"], c["sub_index"]) for c in cfs] == [
+        (0, "master", None),
+        (0, "sub", 0),
+    ]
+
+
+def test_loss_reconcile_meter_name_echoed():
+    """请求给出 name 时，冲突明细回显该名称。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[0, 1],
+            sub_values=[[0, 200]],
+            master_rate=1,
+            sub_rates=[1],
+            step=1,
+            names=True,
+        )
+    )
+    cfs = resp.json()["conflicts"]
+    assert cfs[0]["meter_name"] == "分表0"
+
+
+def test_loss_reconcile_segment_loss_negative():
+    """各表自身可行但该段总表最大用量小于分表最小用量之和：loss 冲突。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[500, 510],  # 用量 10
+            sub_values=[[0, 200]],     # 用量 200
+            master_rate=10,
+            sub_rates=[30],
+        )
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    cfs = body["conflicts"]
+    assert len(cfs) == 1
+    cf = cfs[0]
+    assert cf["kind"] == "loss"
+    assert cf["reason"] == "segment_loss_negative"
+    assert cf["index"] == 0
+    assert (cf["master_usage_min"], cf["master_usage_max"]) == (10, 10)
+    assert (cf["sub_usage_min"], cf["sub_usage_max"]) == (200, 200)
+    assert cf["max_loss"] == -190
+    assert cf["min_loss"] == -190
+    assert cf["required_net_wraps"] == 1
+    assert cf["max_net_wraps"] == 0
+
+
+def test_loss_reconcile_segment_loss_negative_with_wraps():
+    """回绕情形下漏损仍为负：总表用量 200、分表用量 500，D=-1300 需 w>=2。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[900, 100],  # k=1，用量 200
+            sub_values=[[0, 500]],
+            master_rate=100,
+            sub_rates=[100],
+        )
+    )
+    cf = resp.json()["conflicts"][0]
+    assert cf["kind"] == "loss"
+    assert cf["reason"] == "segment_loss_negative"
+    assert cf["reading_diff"] == -1300
+    assert cf["required_net_wraps"] == 2
+    assert cf["max_net_wraps"] == 1
+    assert cf["max_loss"] == -300
+
+
+def test_loss_reconcile_incompatible_modulus():
+    """整期漏损总量与各段 D 之和模 M 不同余：total_incompatible_modulus。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=51,
+            master_values=[0, 500, 200],
+            sub_values=[[0, 450, 150]],
+            master_rate=100,
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    cf = body["conflicts"][0]
+    assert cf["kind"] == "total"
+    assert cf["reason"] == "total_incompatible_modulus"
+    assert cf["expected_remainder"] == 50  # ΣD = 50
+    assert cf["total_net_wraps"] is None
+    assert (cf["feasible_min_total"], cf["feasible_max_total"]) == (50, 50)
+
+
+def test_loss_reconcile_out_of_range_above():
+    """总量同余但高于各段非负漏损上界之和：total_out_of_range（K 仍给出）。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=36300,  # ΣD=300，可行 [300,35300]，36300 同余但超界
+            master_values=[0, 500],
+            sub_values=[[0, 200]],
+            master_rate=10,
+            step=3600,
+        )
+    )
+    cf = resp.json()["conflicts"][0]
+    assert cf["kind"] == "total"
+    assert cf["reason"] == "total_out_of_range"
+    assert cf["feasible_min_total"] == 300
+    assert cf["feasible_max_total"] == 35300
+    assert cf["expected_remainder"] is None
+    assert cf["total_net_wraps"] == 36
+
+
+def test_loss_reconcile_loss_negative_precedes_total_conflict():
+    """单段漏损无法非负时优先返回分段冲突，不再做整期总量联立。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=99999,
+            master_values=[500, 510],
+            sub_values=[[0, 200]],
+            master_rate=10,
+            sub_rates=[30],
+        )
+    )
+    cfs = resp.json()["conflicts"]
+    assert len(cfs) == 1
+    assert cfs[0]["kind"] == "loss"
+
+
+def test_loss_reconcile_meter_conflict_precedes_loss_conflict():
+    """存在单表无解时不进入漏损判定；只返回 meter 冲突。"""
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[900, 800],  # 总表无解
+            sub_values=[[0, 200]],     # 分表用量更大（若联立本也会漏损为负）
+            master_rate=1,
+            sub_rates=[30],
+        )
+    )
+    cfs = resp.json()["conflicts"]
+    assert {c["kind"] for c in cfs} == {"meter"}
+
+
+def test_loss_reconcile_negative_total_rejected():
+    """整期漏损总量为负：422。"""
+    payload = _loss_payload(
+        total_loss=0, master_values=[0, 0], sub_values=[[0, 0]]
+    )
+    payload["total_loss"] = -1
+    resp = _loss(payload)
+    assert resp.status_code == 422
+
+
+def test_loss_reconcile_timestamps_strictly_increasing():
+    """时间点非严格递增：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["timestamps"][1] = payload["timestamps"][0]
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_naive_timestamp_rejected():
+    """时间点缺时区：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["timestamps"][0] = "2026-09-24T00:00:00"
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_subsecond_timestamp_rejected():
+    """时间点含亚秒：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["timestamps"][1] = "2026-09-24T00:00:10.500Z"
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_timezone_offset_normalized():
+    """非 UTC 时区表达换算为 UTC，结果与 UTC 一致。"""
+    payload = _loss_payload(
+        total_loss=0,
+        master_values=[100, 600],
+        sub_values=[[0, 300], [900, 100]],
+        master_rate=100,
+        sub_rates=[100, 100],
+    )
+    payload["timestamps"] = [
+        "2026-09-24T08:00:00+08:00",
+        "2026-09-24T08:00:10+08:00",
+    ]
+    body = _loss(payload).json()
+    assert body["status"] == "ok"
+    seg = body["segments"][0]
+    assert seg["start_timestamp"] == "2026-09-24T00:00:00Z"
+    assert seg["end_timestamp"] == "2026-09-24T00:00:10Z"
+    assert seg["elapsed_seconds"] == 10
+    assert seg["loss"] == 0
+
+
+def test_loss_reconcile_value_count_must_match_timestamps():
+    """某表读数数量与时间点数量不一致：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["sub_meters"][0]["values"] = [0]
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_value_out_of_modulus_range():
+    """读数越界：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]], modulus=1000)
+    payload["master_meter"]["values"][1] = 1000
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_requires_sub_meters():
+    """分表至少 1 块：空数组 422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["sub_meters"] = []
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_requires_two_timestamps():
+    """时间点至少 2 个：422。"""
+    payload = _loss_payload(0, [0], [[0]])
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_negative_rate_rejected():
+    """负速率：422。"""
+    payload = _loss_payload(0, [0, 0], [[0, 0]])
+    payload["master_meter"]["max_rate_per_second"] = -1
+    assert _loss(payload).status_code == 422
+
+
+def test_loss_reconcile_fractional_rate_exact():
+    """小数速率按精确分数取整：容量 floor(0.5×3)=1。"""
+    # 总表 3s 用量 1，分表 3s 用量 1，漏损 0 唯一
+    resp = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[0, 1],
+            sub_values=[[0, 1]],
+            master_rate="0.5",
+            sub_rates=["0.5"],
+            step=3,
+        )
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["segments"][0]["loss"] == 0
+
+    # 总表用量 2 超出容量 1：meter no_solution
+    resp2 = _loss(
+        _loss_payload(
+            total_loss=0,
+            master_values=[0, 2],
+            sub_values=[[0, 1]],
+            master_rate="0.5",
+            sub_rates=["0.5"],
+            step=3,
+        )
+    )
+    assert resp2.json()["conflicts"][0]["kind"] == "meter"
+
+
+# ---------------------------------------------------------------------------
+# 核心逻辑对拍：solve_loss_segment + reconcile_total 与全枚举一致
+# ---------------------------------------------------------------------------
+
+
+def _enumerate_loss_segments(seg_specs, modulus, total_loss):
+    """枚举全部表圈数组合，返回 (状态, 各段净圈数集合, 可行漏损总量集合)。
+
+    seg_specs[i] = [(d, lo, hi), ...]：第 0 块为总表，其余为分表。
+    """
+    per_segment_losses = []
+    feasible_totals = set()
+    segment_net_sets = []
+    segment_feasible = True
+    for specs in seg_specs:
+        meter_ranges = [range(lo, hi + 1) for _, lo, hi in specs]
+        losses = {}
+        for combo in itertools.product(*meter_ranges):
+            u_total = specs[0][0] + combo[0] * modulus
+            u_sub = sum(
+                d + k * modulus for (d, _, _), k in zip(specs[1:], combo[1:])
+            )
+            loss = u_total - u_sub
+            net = combo[0] - sum(combo[1:])
+            if loss >= 0:
+                losses.setdefault(net, loss)
+        if not losses:
+            segment_feasible = False
+        segment_net_sets.append(losses)
+    if segment_feasible:
+        for choices in itertools.product(*(s.keys() for s in segment_net_sets)):
+            feasible_totals.add(sum(segment_net_sets[i][w] for i, w in enumerate(choices)))
+        per_segment_losses = segment_net_sets
+    return segment_feasible, per_segment_losses, feasible_totals
+
+
+def test_loss_segment_exact_by_brute_force():
+    """随机小参数：区间差/非负收紧/总量联立结果与全枚举逐值一致。"""
+    rng = random.Random(2026092601)
+    checked = 0
+    for _ in range(1500):
+        modulus = rng.choice([1, 2, 3, 5, 7, 10])
+        n_seg = rng.randint(1, 3)
+        n_sub = rng.randint(1, 3)
+        seg_specs = []
+        core_segs = []
+        for _ in range(n_seg):
+            specs = []
+            for _ in range(1 + n_sub):
+                d = rng.randrange(modulus) - rng.randrange(modulus)
+                lo = 0 if d >= 0 else math.ceil(-d / modulus)
+                hi = lo + rng.randint(0, 4)
+                specs.append((d, lo, hi))
+            seg_specs.append(specs)
+            core_segs.append(
+                solve_loss_segment(
+                    index=len(core_segs),
+                    total_diff=specs[0][0],
+                    total_bounds=(specs[0][1], specs[0][2]),
+                    sub_diffs=[s[0] for s in specs[1:]],
+                    sub_bounds=[(s[1], s[2]) for s in specs[1:]],
+                    modulus=modulus,
+                )
+            )
+
+        feasible, net_sets, totals = _enumerate_loss_segments(
+            seg_specs, modulus, 0
+        )
+
+        infeasible_idx = {i for i, s in enumerate(core_segs) if not s.feasible}
+        if not feasible:
+            assert infeasible_idx, (modulus, seg_specs)
+            continue
+        assert not infeasible_idx, (modulus, seg_specs)
+        for i, seg in enumerate(core_segs):
+            nets = sorted(net_sets[i].keys())
+            assert seg.min_net_wraps == nets[0], (modulus, seg_specs, i)
+            assert seg.max_net_wraps == nets[-1], (modulus, seg_specs, i)
+            losses = sorted(net_sets[i].values())
+            assert seg.min_loss == losses[0]
+            assert seg.max_loss == losses[-1]
+            # 净圈数区间连续：每个整数净圈数都能达到
+            assert set(range(nets[0], nets[-1] + 1)) == set(nets)
+
+        # 抽测可行与不可行总量
+        targets = set(totals)
+        ordered = sorted(totals)
+        for delta in (-2, -1, 1, 2):
+            base = rng.choice(ordered)
+            targets.add(base + delta)
+        targets.update([ordered[0] - modulus, ordered[-1] + modulus])
+        diffs = [s.diff for s in core_segs]
+        bounds = [(s.min_net_wraps, s.max_net_wraps) for s in core_segs]
+        for L in targets:
+            if L < 0:
+                continue
+            r = reconcile_total(diffs, bounds, L, modulus)
+            joint = [
+                tuple(sorted({
+                    combo[i]
+                    for combo in itertools.product(
+                        *(ns.keys() for ns in net_sets)
+                    )
+                    if sum(net_sets[j][combo[j]] for j in range(n_seg)) == L
+                }))
+                for i in range(n_seg)
+            ]
+            if L in totals:
+                checked += 1
+                assert r.status == "ok", (modulus, seg_specs, L, r.conflicts)
+                for i, ns in enumerate(r.narrowed):
+                    assert (ns.min_wraps, ns.max_wraps) == (
+                        joint[i][0],
+                        joint[i][-1],
+                    ), (modulus, seg_specs, L, i, joint[i])
+                    lo_loss, hi_loss = ns.usage_bounds(modulus)
+                    assert lo_loss == net_sets[i][joint[i][0]]
+                    assert hi_loss == net_sets[i][joint[i][-1]]
+            else:
+                assert r.status == "conflict"
+                expect = (
+                    "total_incompatible_modulus"
+                    if (L - sum(diffs)) % modulus != 0
+                    else "total_out_of_range"
+                )
+                assert r.conflicts == (expect,), (modulus, seg_specs, L)
+    assert checked > 500

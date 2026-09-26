@@ -126,6 +126,32 @@
     步取满足 dist[q] = dist[cur]+1 且 dist[q]+tail[q] = D 的最小后继
     q（最长路上的点必有这样的最优后继），归纳得到字典序最小的完整序
     列。逐对判定与 DP 均为 O(n²)，不枚举保留子序列。
+
+总分表漏损复核（solve_loss_segment）：
+    同模数 M 的一块总表与若干分表在共用时刻点上各有读数。段 i 各表用量
+    u_m,i = d_m,i + k_m,i*M（d 为段内读数差，k_m 为该表该段非负回绕圈
+    数，各表先经 solve_segment 同一非负增量/速率校验夹出连续整数区间
+    [lo_m,i, hi_m,i]，调用方保证每表每段可行）。该段漏损
+        l_i = u_total,i - Σ_m u_sub_m,i
+            = D_i + w_i*M
+        D_i = d_total,i - Σ_m d_sub_m,i
+        w_i = k_total,i - Σ_m k_sub_m,i
+    同模数下整数区间之差仍为连续整数区间，故 w_i 不经枚举即取遍
+        [lo_w_i, hi_w_i] =
+            [lo_total,i - Σ hi_sub_m,i, hi_total,i - Σ lo_sub_m,i]
+    中的每个整数（区间闵可夫斯基差：各表圈数独立，端点组合均可达到）。
+    漏损非负要求 w_i >= ceil(-D_i/M) = -floor(D_i/M)，记
+        need_i = -(D_i // M)
+    收紧后 w_i ∈ [max(lo_w_i, need_i), hi_w_i]；该段可行漏损为同余类
+    l_i ≡ D_i (mod M) 落在非负半轴上的连续项：
+        min_loss_i = D_i + max(lo_w_i, need_i)*M
+        max_loss_i = D_i + hi_w_i*M（未收紧即 max_loss_i < 0 时为负，
+    说明即使总表取最大、分表全取最小漏损仍为负，该段漏损无法非负）。
+    整期漏损总量 L = Σ l_i = ΣD_i + M*Σw_i，与 reconcile_total 完全同
+    构：(L - ΣD_i)/M 必须为整数（total_incompatible_modulus），且
+    Σw_i 落在各段收紧后区间和之内（total_out_of_range）；固定后各段
+    w_i 由同一整数区间公式收紧，w_i 唯一时该段漏损才唯一确定，不枚举
+    任何回绕组合。
 """
 
 from __future__ import annotations
@@ -153,6 +179,8 @@ REASON_INSUFFICIENT_CAPACITY = "insufficient_capacity"
 REASON_INCOMPATIBLE_MODULUS = "incompatible_modulus"
 # 同余相容但两表可行用量范围之交内没有共同候选
 REASON_RANGE_DISJOINT = "range_disjoint"
+# 总分表漏损复核冲突原因：某段即使总表取最大用量、各分表取最小用量，漏损仍为负
+REASON_SEGMENT_LOSS_NEGATIVE = "segment_loss_negative"
 
 
 @dataclass(frozen=True)
@@ -1515,4 +1543,109 @@ def clean_readings(
         status=STATUS_OK,
         kept_indices=tuple(kept),
         removed_indices=removed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 总分表漏损复核（loss-reconcile）：同模数总表/分表圈数区间之差，非负漏损
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LossSegmentResult:
+    """单个相邻时刻点上总表与各分表联立后的漏损可行范围。"""
+
+    index: int
+    diff: int  # D_i = 总表段内读数差 - 各分表段内读数差之和
+    # 非负漏损要求的最小净圈数 need_i = -floor(D_i / M)
+    required_net_wraps: int
+    # 各表圈数独立取区间值时，净圈数 w_i 的连续整数区间（区间闵可夫斯基差）
+    raw_min_net_wraps: int
+    raw_max_net_wraps: int
+    # 漏损非负收紧后的净圈数区间；无法非负时 clamped_min > raw_max
+    min_net_wraps: int
+    max_net_wraps: int
+    # 非负收紧前的漏损上下界（max_loss 为负即该段漏损无法非负）
+    raw_min_loss: int
+    raw_max_loss: int
+    min_loss: Optional[int]  # 收紧后最小非负可行漏损；无法非负时为 None
+    max_loss: Optional[int]  # 收紧后最大可行漏损；无法非负时为 None
+
+    @property
+    def feasible(self) -> bool:
+        """该段是否存在非负漏损（总表用量不小于分表用量之和）。"""
+        return self.max_net_wraps >= self.min_net_wraps
+
+
+def solve_loss_segment(
+    index: int,
+    total_diff: int,
+    total_bounds: Tuple[int, int],
+    sub_diffs: Sequence[int],
+    sub_bounds: Sequence[Tuple[int, int]],
+    modulus: int,
+) -> LossSegmentResult:
+    """由同模数下总表与各分表的可行圈数区间求该段非负漏损范围，不枚举圈数。
+
+    段内各表（总表 1 块、分表若干块）模数同为 ``modulus``，段内读数差
+    为 ``d_m``，非负增量与速率上限夹出的可行回绕圈数区间为
+    ``[lo_m, hi_m]``（调用方保证每表该段均可行）。段漏损
+
+        l = u_total - Σ u_sub
+          = (d_total - Σ d_sub) + (k_total - Σ k_sub) * modulus
+          = D + w*M
+
+    各表圈数相互独立，整数区间之差仍为连续整数区间（区间闵可夫斯基差，
+    端点组合均可达到），故 ``w`` 不经枚举即取遍
+
+        w ∈ [lo_total - Σ hi_sub, hi_total - Σ lo_sub]
+
+    漏损非负要求 ``w >= ceil(-D/M) = -floor(D/M)``（Python 地板除直接
+    给出）。收紧后下界大于上界即该段漏损无法非负（即使总表取最大用量、
+    分表全取最小用量仍为负）。可行时该段漏损为同余类 ``l ≡ D (mod M)``
+    落在非负半轴上的连续项，最小项即收紧下界处的非负漏损。
+
+    :param total_bounds: 总表该段可行圈数区间 ``(k_min, k_max)``
+    :param sub_bounds: 各分表该段可行圈数区间，与 ``sub_diffs`` 一一对应
+    """
+    if len(sub_diffs) != len(sub_bounds):
+        raise ValueError("sub_diffs 与 sub_bounds 数量必须一致")
+    if not sub_diffs:
+        raise ValueError("至少需要一块分表")
+
+    diff = total_diff - sum(sub_diffs)
+    total_lo, total_hi = total_bounds
+    sub_lo_sum = sum(lo for lo, _ in sub_bounds)
+    sub_hi_sum = sum(hi for _, hi in sub_bounds)
+
+    # w = k_total - Σ k_sub：区间之差为连续整数区间，每个整数都可达到
+    raw_lo = total_lo - sub_hi_sum
+    raw_hi = total_hi - sub_lo_sum
+
+    # 漏损非负：D + w*M >= 0 <=> w >= ceil(-D/M) = -floor(D/M)
+    required = -(diff // modulus)
+    lo = max(raw_lo, required)
+    hi = raw_hi
+
+    raw_min_loss = diff + raw_lo * modulus
+    raw_max_loss = diff + raw_hi * modulus
+    if lo > hi:
+        min_loss: Optional[int] = None
+        max_loss: Optional[int] = None
+    else:
+        min_loss = diff + lo * modulus
+        max_loss = diff + hi * modulus
+
+    return LossSegmentResult(
+        index=index,
+        diff=diff,
+        required_net_wraps=required,
+        raw_min_net_wraps=raw_lo,
+        raw_max_net_wraps=raw_hi,
+        min_net_wraps=lo,
+        max_net_wraps=hi,
+        raw_min_loss=raw_min_loss,
+        raw_max_loss=raw_max_loss,
+        min_loss=min_loss,
+        max_loss=max_loss,
     )
